@@ -8,3 +8,6 @@ __pycache__/
 finetune/data/
 finetune/adapters/
 finetune/roadwatch-qwen3-14b/
+node_modules/
+build/
+dist/

@@ -23,11 +23,13 @@ from .models import (EvidenceInput, FinancialInput, ImportInput, InvestigationIn
                      CommentInput, CommentUpdate, FindingStatusInput, ForgotPassword, InviteAccept, LimitsInput, MemberInput, MemberUpdate,
                      PasswordChange, ProfileUpdate, SignupInput,
                      ObservationInput, OpenDataInput, ProjectInput, SettingsInput, VendorInput)
+from .support_api import router as support_router
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT.parent / ".env")  # Never load the unrelated parent project's credentials.
 app = FastAPI(title="Roadwatch", version="0.2.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+app.include_router(support_router)
 
 GUEST_CLOSED = re.compile(r"/api/(members(/.*)?|me(/.*)?|projects/[^/]+/comments(/.*)?)")
 PUBLIC_PATHS = {"/api/login", "/api/guest", "/api/session", "/healthz", "/api/invite/accept", "/api/password/forgot", "/api/signup"}
@@ -71,9 +73,12 @@ async def request_boundary(request: Request, call_next):
         if request.state.user["role"] == "guest" and GUEST_CLOSED.fullmatch(path) and not (request.method == "GET" and path == "/api/me"):
             return JSONResponse({"detail": "Guests can work on cases but cannot post in the discussion or manage accounts. Sign in to do that."}, status_code=403)
         if request.method in {"POST", "PUT", "DELETE", "PATCH"} and request.state.user["role"] == "viewer" \
-                and not (path.endswith("/comments") or "/comments/" in path or path.endswith("/status") or path == "/api/logout"):
+                and not (path.endswith("/comments") or "/comments/" in path or path.endswith("/status") or path == "/api/logout"
+                         or path in {"/api/support/message", "/api/support/history"}):
             return JSONResponse({"detail": "Viewers can read and discuss but not change the case. Ask an admin for the investigator role."}, status_code=403)
     response = await call_next(request)
+    if path.startswith("/api/support"):
+        response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Frame-Options"] = "DENY"
@@ -107,7 +112,7 @@ def store_document(project_id, project, *, title, kind, pages, raw, filename, so
 
 def static_version():
     digest = hashlib.sha256()
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "style.css", "support.js", "support.css"):
         digest.update((ROOT / "static" / name).read_bytes())
     return digest.hexdigest()[:10]
 
@@ -118,6 +123,7 @@ def index():
     html = (ROOT / "static" / "index.html").read_text()
     version = static_version()
     html = html.replace('"/static/style.css"', f'"/static/style.css?v={version}"').replace('"/static/app.js"', f'"/static/app.js?v={version}"')
+    html = html.replace('"/static/support.css"', f'"/static/support.css?v={version}"').replace('"/static/support.js"', f'"/static/support.js?v={version}"')
     return Response(html, media_type="text/html")
 
 

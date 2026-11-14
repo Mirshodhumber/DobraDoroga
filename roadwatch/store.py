@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -64,6 +65,15 @@ def database():
                 "CREATE TABLE IF NOT EXISTS finding_status (project_id TEXT NOT NULL, finding_key TEXT NOT NULL, body TEXT NOT NULL, "
                 "PRIMARY KEY (project_id, finding_key))"
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS support_threads (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, project_id TEXT, "
+                "messages TEXT NOT NULL, expires_at REAL NOT NULL, lock_until REAL NOT NULL DEFAULT 0, run_id TEXT)"
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS support_project ON support_threads(project_id)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS support_usage (owner_id TEXT NOT NULL, day TEXT NOT NULL, runs INTEGER NOT NULL, "
+                "PRIMARY KEY (owner_id, day))"
+            )
             yield connection
     finally:
         connection.close()
@@ -72,6 +82,7 @@ def database():
 @_backend
 def delete_project(project_id):
     with database() as connection:
+        connection.execute("DELETE FROM support_threads WHERE project_id = ?", (project_id,))
         return connection.execute("DELETE FROM projects WHERE id = ?", (project_id,)).rowcount > 0
 
 
@@ -320,3 +331,94 @@ def set_finding_status(project_id, finding_key, status):
     with database() as connection:
         connection.execute("INSERT OR REPLACE INTO finding_status VALUES (?, ?, ?)", (project_id, finding_key, json.dumps(status)))
     return status
+
+
+# Support conversations are private to one signed-in user and one case (or the welcome screen).
+# A persisted lease serializes turns across tabs/workers. Clearing a chat invalidates an in-flight turn.
+def support_key(owner_id, project_id):
+    return hashlib.sha256(json.dumps([owner_id, project_id]).encode()).hexdigest()
+
+
+def _support_summary(project, counts, report):
+    return {"id": project["id"], "name": project["name"], "anchor": project.get("anchor", "street"),
+            "revision": project.get("revision", 0), "counts": counts,
+            "report_stale": bool(report and report.get("revision") != project.get("revision", 0)),
+            "has_locations": bool(project.get("locations")), "demo": bool(project.get("demo"))}
+
+
+@_backend
+def support_case_summary(project_id):
+    project = get_project(project_id)
+    if not project:
+        return None
+    return _support_summary(project, {k: len(project.get(k, [])) for k in
+                                     ("evidence", "finances", "observations", "open_data", "reports")},
+                            project["reports"][-1] if project.get("reports") else None)
+
+
+@_backend
+def support_history(owner_id, project_id):
+    with database() as connection:
+        connection.execute("DELETE FROM support_threads WHERE expires_at <= ?", (time.time(),))
+        row = connection.execute("SELECT messages FROM support_threads WHERE id = ? AND owner_id = ?",
+                                 (support_key(owner_id, project_id), owner_id)).fetchone()
+    return json.loads(row["messages"]) if row else []
+
+
+@_backend
+def support_acquire(owner_id, project_id, run_id, expires_at, lease_until):
+    key, stamp = support_key(owner_id, project_id), time.time()
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM support_threads WHERE expires_at <= ?", (stamp,))
+        row = connection.execute("SELECT lock_until FROM support_threads WHERE id = ?", (key,)).fetchone()
+        if row and row["lock_until"] > stamp:
+            return False
+        connection.execute(
+            "INSERT INTO support_threads VALUES (?, ?, ?, '[]', ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, lock_until=excluded.lock_until, run_id=excluded.run_id",
+            (key, owner_id, project_id, expires_at, lease_until, run_id))
+    return True
+
+
+@_backend
+def support_complete(owner_id, project_id, run_id, turn):
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT messages FROM support_threads WHERE id = ? AND owner_id = ? AND run_id = ? "
+                                 "AND lock_until > ? AND expires_at > ?",
+                                 (support_key(owner_id, project_id), owner_id, run_id, time.time(), time.time())).fetchone()
+        if not row:
+            return False
+        messages = (json.loads(row["messages"]) + [turn])[-12:]
+        connection.execute("UPDATE support_threads SET messages = ?, lock_until = 0, run_id = NULL WHERE id = ?",
+                           (json.dumps(messages), support_key(owner_id, project_id)))
+    return True
+
+
+@_backend
+def support_release(owner_id, project_id, run_id):
+    with database() as connection:
+        connection.execute("UPDATE support_threads SET lock_until = 0, run_id = NULL WHERE id = ? AND owner_id = ? AND run_id = ?",
+                           (support_key(owner_id, project_id), owner_id, run_id))
+
+
+@_backend
+def support_clear(owner_id, project_id):
+    with database() as connection:
+        connection.execute("DELETE FROM support_threads WHERE id = ? AND owner_id = ?", (support_key(owner_id, project_id), owner_id))
+
+
+@_backend
+def reserve_support_run(owner_id, daily_limit):
+    day = datetime.now(timezone.utc).date().isoformat()
+    with database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        # Counters are separate from investigation usage and are not reset by Clear chat.
+        connection.execute("DELETE FROM support_usage WHERE day < date(?, '-30 days')", (day,))
+        row = connection.execute("SELECT runs FROM support_usage WHERE owner_id = ? AND day = ?", (owner_id, day)).fetchone()
+        count = row["runs"] if row else 0
+        if count >= daily_limit:
+            return False
+        connection.execute("INSERT OR REPLACE INTO support_usage VALUES (?, ?, ?)", (owner_id, day, count + 1))
+    return True
