@@ -3,6 +3,7 @@ import inspect
 import os
 import re
 import threading
+import time
 
 import pytest
 
@@ -131,6 +132,9 @@ def test_migration_copies_a_sqlite_database(tmp_path, monkeypatch):
     comment = store.add_comment(project["id"], {"text": "note"})
     store.set_finding_status(project["id"], "k", {"status": "dismissed"})
     store.reserve_ai_run(5)
+    store.support_acquire(member["id"], project["id"], "turn", time.time() + 3600, time.time() + 60)
+    store.support_complete(member["id"], project["id"], "turn", {"message": "Where do I start?", "answer": "Open the map."})
+    store.reserve_support_run(member["id"], 1)
     expected = store.get_project(project["id"])
 
     monkeypatch.setenv("ROADWATCH_MONGODB_URI", uri)
@@ -139,6 +143,8 @@ def test_migration_copies_a_sqlite_database(tmp_path, monkeypatch):
     assert store.member_by_email("ana@example.org")["id"] == member["id"] and store.public_member(member["id"])["has_password"] == 1
     assert store.comments(project["id"])[0]["id"] == comment["id"]
     assert store.finding_statuses(project["id"])["k"]["status"] == "dismissed" and store.ai_runs_today() == 1
+    assert store.support_history(member["id"], project["id"])[0]["answer"] == "Open the map."
+    assert not store.reserve_support_run(member["id"], 1)
     with pytest.raises(SystemExit):
         migrate_mongo.migrate()
     assert migrate_mongo.migrate(replace=True)["cases"] == 1 and len(store.list_projects()) == 1

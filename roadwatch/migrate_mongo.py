@@ -11,13 +11,14 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from . import store
 
-COLLECTIONS = ("projects", "parts", "members", "comments", "finding_status", "ai_usage")
+COLLECTIONS = ("projects", "parts", "members", "comments", "finding_status", "ai_usage", "support_threads", "support_usage")
 
 
 def migrate(replace=False):
@@ -34,6 +35,8 @@ def migrate(replace=False):
         comments = [dict(row) for row in connection.execute("SELECT * FROM comments")]
         statuses = [dict(row) for row in connection.execute("SELECT * FROM finding_status")]
         usage = [dict(row) for row in connection.execute("SELECT * FROM ai_usage")]
+        support_threads = [dict(row) for row in connection.execute("SELECT * FROM support_threads")]
+        support_usage = [dict(row) for row in connection.execute("SELECT * FROM support_usage")]
     for project in projects:
         body, manifest, parts = store_mongo._split(project["id"], project)
         store_mongo._store(db, parts)
@@ -48,6 +51,19 @@ def migrate(replace=False):
                                        for s in statuses])
     if usage:
         db.ai_usage.insert_many([{"_id": u["day"], "runs": u["runs"]} for u in usage])
+    if support_threads:
+        db.support_threads.insert_many([{
+            "_id": t["id"], "owner_id": t["owner_id"], "project_id": t["project_id"], "messages": json.loads(t["messages"]),
+            "expires_at": datetime.fromtimestamp(t["expires_at"], timezone.utc),
+            # No worker is processing a SQLite chat in the new deployment.
+            "lock_until": datetime.fromtimestamp(0, timezone.utc), "run_id": None,
+        } for t in support_threads])
+    if support_usage:
+        from datetime import timedelta
+        db.support_usage.insert_many([{
+            "_id": store.support_key(u["owner_id"], u["day"]), "runs": u["runs"],
+            "expires_at": datetime.fromisoformat(u["day"]).replace(tzinfo=timezone.utc) + timedelta(days=30),
+        } for u in support_usage])
     return {"database": db.name, "cases": len(projects), "parts": db.parts.estimated_document_count(), "members": len(members),
             "comments": len(comments), "finding_statuses": len(statuses)}
 

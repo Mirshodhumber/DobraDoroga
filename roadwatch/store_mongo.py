@@ -12,7 +12,7 @@ import os
 import threading
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import certifi
 from pymongo import ASCENDING, MongoClient
@@ -20,7 +20,7 @@ from pymongo.collation import Collation
 from pymongo.errors import DuplicateKeyError
 
 from . import search
-from .store import _upgrade, identifier, now
+from .store import _support_summary, _upgrade, identifier, now, support_key
 
 SPLIT = ("evidence", "open_data", "reports")
 SUMMARY_FIELDS = ("id", "name", "road", "contractor", "demo", "created_at", "anchor")
@@ -51,6 +51,9 @@ def _db():
         db.members.create_index([("email", ASCENDING)], unique=True, partialFilterExpression={"email": {"$type": "string"}})
         db.comments.create_index([("project_id", ASCENDING), ("created_at", ASCENDING)])
         db.finding_status.create_index([("project_id", ASCENDING), ("finding_key", ASCENDING)], unique=True)
+        db.support_threads.create_index("expires_at", expireAfterSeconds=0)
+        db.support_threads.create_index("project_id")
+        db.support_usage.create_index("expires_at", expireAfterSeconds=0)
         _ready.add((uri, name))
     return db
 
@@ -136,6 +139,7 @@ def delete_project(project_id):
     deleted = db.projects.delete_one({"_id": project_id}).deleted_count > 0
     db.parts.delete_many({"project_id": project_id})
     db.chunks.delete_many({"project_id": project_id})
+    db.support_threads.delete_many({"project_id": project_id})
     return deleted
 
 
@@ -337,3 +341,67 @@ def set_finding_status(project_id, finding_key, status):
     _db().finding_status.replace_one({"project_id": project_id, "finding_key": finding_key},
                                      {"project_id": project_id, "finding_key": finding_key, "body": _plain(status)}, upsert=True)
     return status
+
+
+def support_case_summary(project_id):
+    """Read counts and one report revision without downloading evidence or report snapshots."""
+    db = _db()
+    row = db.projects.find_one({"_id": project_id})
+    if not row:
+        return None
+    counts = {k: len(row["parts"].get(k, [])) for k in SPLIT}
+    counts.update({k: len(row["body"].get(k, [])) for k in ("finances", "observations")})
+    report_ids = row["parts"].get("reports", [])
+    last = db.parts.find_one({"_id": report_ids[-1]}, {"body.revision": 1}) if report_ids else None
+    return _support_summary(row["body"], counts, last.get("body") if last else None)
+
+
+def support_history(owner_id, project_id):
+    row = _db().support_threads.find_one({"_id": support_key(owner_id, project_id), "owner_id": owner_id,
+                                         "expires_at": {"$gt": datetime.now(timezone.utc)}})
+    return row["messages"] if row else []
+
+
+def support_acquire(owner_id, project_id, run_id, expires_at, lease_until):
+    db, stamp, key = _db(), datetime.now(timezone.utc), support_key(owner_id, project_id)
+    db.support_threads.delete_one({"_id": key, "expires_at": {"$lte": stamp}})
+    try:
+        db.support_threads.update_one(
+            {"_id": key, "owner_id": owner_id, "lock_until": {"$lte": stamp}},
+            {"$set": {"run_id": run_id, "lock_until": datetime.fromtimestamp(lease_until, timezone.utc),
+                      "expires_at": datetime.fromtimestamp(expires_at, timezone.utc)},
+             "$setOnInsert": {"project_id": project_id, "messages": []}}, upsert=True)
+    except DuplicateKeyError:  # Another worker owns this conversation's lease.
+        return False
+    return True
+
+
+def support_complete(owner_id, project_id, run_id, turn):
+    stamp = datetime.now(timezone.utc)
+    return _db().support_threads.update_one(
+        {"_id": support_key(owner_id, project_id), "owner_id": owner_id, "run_id": run_id,
+         "lock_until": {"$gt": stamp}, "expires_at": {"$gt": stamp}},
+        {"$push": {"messages": {"$each": [_plain(turn)], "$slice": -12}},
+         "$set": {"lock_until": datetime.fromtimestamp(0, timezone.utc), "run_id": None}}).matched_count > 0
+
+
+def support_release(owner_id, project_id, run_id):
+    _db().support_threads.update_one({"_id": support_key(owner_id, project_id), "owner_id": owner_id, "run_id": run_id},
+                                    {"$set": {"lock_until": datetime.fromtimestamp(0, timezone.utc), "run_id": None}})
+
+
+def support_clear(owner_id, project_id):
+    _db().support_threads.delete_one({"_id": support_key(owner_id, project_id), "owner_id": owner_id})
+
+
+def reserve_support_run(owner_id, daily_limit):
+    if daily_limit <= 0:
+        return False
+    stamp = datetime.now(timezone.utc)
+    key = support_key(owner_id, stamp.date().isoformat())
+    try:
+        _db().support_usage.update_one({"_id": key, "runs": {"$lt": daily_limit}},
+                                      {"$inc": {"runs": 1}, "$setOnInsert": {"expires_at": stamp + timedelta(days=30)}}, upsert=True)
+    except DuplicateKeyError:
+        return False
+    return True

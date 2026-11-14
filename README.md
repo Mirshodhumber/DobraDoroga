@@ -177,6 +177,16 @@ Per investigation the model cost is a few cents; the daily cap is a guard agains
 
 ## Development
 
+### In-app support assistant
+
+**Ask Roadwatch** guides people through the current case, document uploads, spending and investigations. It uses
+read-only help/status tools and offers navigation buttons; users submit changes through the normal forms. Chat history
+is scoped to the signed-in account and case, works with SQLite or MongoDB, and can be cleared. With no model configured,
+the widget clearly shows **Guide mode**. See [the support agent review guide](docs/support-agent.md) for configuration,
+architecture, test prompts and the optional live-model check.
+
+### Tests
+
 ```sh
 .venv/bin/python -m pytest -q
 # the same suite on MongoDB (each test uses its own database on this server and drops it afterwards):

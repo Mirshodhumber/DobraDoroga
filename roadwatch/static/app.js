@@ -101,6 +101,7 @@ function empty(title, description, button = "") {
   return `<div class="panel empty"><div class="symbol">⌕</div><h2>${title}</h2><p>${description}</p>${button}</div>`;
 }
 function render() {
+  publishSupportContext();
   const workspace = $("#workspace");
   if (!current) {
     workspace.innerHTML = `<div class="welcome"><p class="eyebrow">PUBLIC WORKS. PUBLIC SPENDING. PUBLIC ACCOUNTABILITY.</p><h1>Follow the money.<br>Check the road.<br>Find the evidence.</h1><p class="lead">Investigate a road construction contract from its public records — or follow one supplier across federal, provincial and municipal spending: import the records, record what was paid, and let the investigator surface the discrepancies worth a closer look.</p><div class="actions"><button class="primary" data-action="new-project">Start a case →</button><button class="secondary" data-action="demo">See a sample case</button></div><div class="steps"><div class="step"><span>01</span><h3>Gather the records</h3><p>Pull what governments publish about a road or a company, and import award reports, change orders, invoices and inspections straight from the publisher's site.</p></div><div class="step"><span>02</span><h3>Trace the spending</h3><p>Record each amount with its source quotation. Like-for-like totals are compared automatically.</p></div><div class="step"><span>03</span><h3>Investigate</h3><p>The AI reads every page, follows leads across documents and returns cited findings, counter-explanations and the records still missing.</p></div></div></div>`;
@@ -126,6 +127,29 @@ function render() {
   if (tab === "discussion") { if (!discussion) loadDiscussion(); clearTimeout(discussionTimer); discussionTimer = setTimeout(function poll() { if (tab === "discussion" && current) loadDiscussion(true).then(() => { discussionTimer = setTimeout(poll, 20000); }); }, 20000); }
   if (tab === "map") { mountMap(); $("#condition-toggle")?.addEventListener("change", e => toggleCondition(e.target.checked).catch(err => notify(err.message, true))); } else map = null;
 }
+// Support uses these two events instead of sharing mutable application state.
+function publishSupportContext() {
+  document.dispatchEvent(new CustomEvent("roadwatch:context", { detail: {
+    projectId: current?.id || null, page: current ? tab : "welcome", userId: isGuest() ? null : me?.id || null,
+  } }));
+}
+document.addEventListener("roadwatch:support-ready", publishSupportContext);
+document.addEventListener("roadwatch:support-signin", showLogin);
+document.addEventListener("roadwatch:support-navigate", event => {
+  const { kind, target, projectId } = event.detail || {};
+  if (busy) return notify("Wait for the current operation to finish.", true);
+  if ((current?.id || null) !== (projectId || null)) return notify("This suggestion belongs to another case.", true);
+  if (kind === "tab") {
+    const tabs = isVendorCase() ? ["report", "discussion", "vendor", "evidence", "finances"] : ["report", "discussion", "map", "evidence", "finances", "observations"];
+    if (current && tabs.includes(target)) { tab = target; render(); document.querySelector(`[data-tab="${target}"]`)?.focus(); }
+  } else if (kind === "action") {
+    if (target === "setup") return showDialog("setup");
+    if (target === "team" && me?.role === "admin") return openTeamDialog().catch(error => notify(error.message, true));
+    if (!canEdit()) return notify("Ask an administrator for investigator access to add records.", true);
+    if (target === "new-project") { $("#project-form").reset(); return openNewCaseDialog(); }
+    if (current && ["evidence", "finance", "observation"].includes(target)) showDialog(target);
+  }
+});
 function streetList(locations, removable) {
   if (!locations.length) return "";
   return `<ul class="street-list">${locations.map((l, i) => `<li><div class="street-main"><div><strong>${escapeHTML(l.road)}</strong><small>${escapeHTML(l.display_name)}</small></div>${removable ? `<button type="button" class="delete-button" data-remove-street="${i}" aria-label="Remove ${escapeHTML(l.road)}">Remove</button>` : ""}</div>
